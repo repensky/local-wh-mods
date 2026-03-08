@@ -4,6 +4,7 @@
 // @description     Converts Discord toast notifications to classic Windows balloon notifications
 // @version         1.0
 // @author          repensky
+// @github          https://github.com/repensky
 // @include         Discord.exe
 // @include         Discord*.exe
 // @compilerOptions -lole32 -loleaut32 -lruntimeobject -lshlwapi -lshell32
@@ -16,18 +17,19 @@ Converts Discord's modern Windows toast notifications into balloon tips that app
 
 ![Picture](https://raw.githubusercontent.com/repensky/local-wh-mods/refs/heads/main/image.png)
 
-Features:
+## Features:
 - Notification sender and message is shown in the balloon
 - Optionally shows the sender's profile picture as an icon in the balloon
 - Configurable PFP icon size (Small 16px, Medium 24px, Large 32px)
 - Clicking the balloon or tray icon brings Discord to the foreground
 - Tray icon automatically removed when Discord exits
 
-**Note:** Enable this mod before starting Discord. If Discord is already
-running when you enable the mod, restart Discord manually. Otherwise, Discord may **crash** if not restarted on next notification.
+## Note:
+Enable this mod before starting Discord. If Discord is already running when you enable the mod, restart Discord manually. Otherwise, Discord may **crash** if not restarted on next notification.
 
-**Note 2:** Balloon display duration is controlled by Windows
-Control Panel > Ease of Access > Use the computer without a display > How long should Windows notification dialog boxes stay open
+## Note 2:
+Balloon display duration is controlled by Windows.
+To change, navigate to **Control Panel > Ease of Access Center > Use the computer without a display > How long should Windows notification dialog boxes stay open**
 
 */
 // ==/WindhawkModReadme==
