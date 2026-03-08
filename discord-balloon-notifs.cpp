@@ -1,7 +1,7 @@
 // ==WindhawkMod==
 // @id              discord-balloon-notifs
 // @name            Discord Balloon Notifications
-// @description     Converts Discord toast notifications to classic Windows balloon notifications (Local Update 2)
+// @description     Converts Discord toast notifications to classic Windows balloon notifications
 // @version         1.0
 // @author          repensky
 // @github          https://github.com/repensky
