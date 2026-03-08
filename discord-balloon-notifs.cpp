@@ -14,7 +14,7 @@
 # Discord Balloon Notifications
 Converts Discord's modern Windows toast notifications into balloon tips that appear from the system tray using Shell_NotifyIconW.
 
-![Picture]()
+![Picture](https://raw.githubusercontent.com/repensky/local-wh-mods/refs/heads/main/image.png)
 
 Features:
 - Notification sender and message is shown in the balloon
