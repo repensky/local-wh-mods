@@ -6,8 +6,8 @@
 // @author          repensky
 // @github          https://github.com/repensky
 // @include         Discord.exe
-// @include         Discord*.exe
-// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lshlwapi -lshell32
+// @compilerOptions -lole32 -loleaut32 -lruntimeobject -lshlwapi -lshell32 -lwininet
+
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -17,17 +17,23 @@ Converts Discord's modern Windows toast notifications into balloon tips that app
 
 ![Picture](https://raw.githubusercontent.com/repensky/local-wh-mods/refs/heads/main/image.png)
 
+# WARNING!
+The use of third party Discord clients with this mod is **NOT** supported! This mod is designed for the official Discord app. It may or may not function properly with unofficial Discord clients.
+
+Enable this mod before starting Discord. If Discord is already running when you enable the mod, restart Discord manually. Otherwise, Discord may **crash** if not restarted on next notification.
+
+## Requirement:
+Ensure EnableLegacyBalloonNotifications is set to 1 in ``HKEY_CURRENT_USER\SOFTWARE\Policies\Microsoft\Windows\Explorer\EnableLegacyBalloonNotifications``
+
 ## Features:
 - Notification sender and message is shown in the balloon
 - Optionally shows the sender's profile picture as an icon in the balloon
 - Configurable PFP icon size (Small 16px, Medium 24px, Large 32px)
 - Clicking the balloon or tray icon brings Discord to the foreground
 - Tray icon automatically removed when Discord exits
+- Emoji decoding (emoji unicodes are not supported)
 
 ## Note:
-Enable this mod before starting Discord. If Discord is already running when you enable the mod, restart Discord manually. Otherwise, Discord may **crash** if not restarted on next notification.
-
-## Note 2:
 Balloon display duration is controlled by Windows.
 To change, navigate to **Control Panel > Ease of Access Center > Use the computer without a display > How long should Windows notification dialog boxes stay open**
 
@@ -56,6 +62,7 @@ To change, navigate to **Control Panel > Ease of Access Center > Use the compute
 #include <winstring.h>
 #include <tlhelp32.h>
 #include <cwchar>
+#include <wininet.h>
 
 // Settings
 
@@ -82,10 +89,6 @@ static void LoadSettings() {
         g_settings.iconSize = ICON_SIZE_LARGE;
     }
     Wh_FreeStringSetting(iconSizeSetting);
-    
-    Wh_Log(L"Settings: showProfilePicture=%s, iconSize=%d", 
-           g_settings.showProfilePicture ? L"true" : L"false",
-           g_settings.iconSize);
 }
 
 // Helpers
@@ -96,7 +99,6 @@ static void LoadSettings() {
 
 // Discord Process Monitor
 
-static DWORD g_currentPid = 0;
 static HANDLE g_hMonitorThread = nullptr;
 static volatile bool g_stopMonitor = false;
 
@@ -121,64 +123,61 @@ static bool IsAnyDiscordRunning() {
     return found;
 }
 
-// Focus Discord on Balloon Click
+// Find and click Discord's own tray icon to wake it up
 
-struct EnumData {
-    HWND result;
-    DWORD pid;
+struct TrayButtonInfo {
+    HWND hToolbar;
+    int buttonIndex;
+    DWORD ownerPid;
 };
 
-static BOOL CALLBACK FindDiscordWindowProc(HWND h, LPARAM lp) {
-    EnumData* d = (EnumData*)lp;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(h, &pid);
-    if (pid == d->pid && IsWindowVisible(h)) {
-        WCHAR cls[256];
-        GetClassNameW(h, cls, 256);
-        if (wcsstr(cls, L"Chrome_WidgetWin") || wcsstr(cls, L"Discord")) {
-            WCHAR title[256];
-            if (GetWindowTextW(h, title, 256) > 0) {
-                d->result = h;
-                return FALSE;
-            }
-        }
-    }
-    return TRUE;
-}
-
 static void FocusDiscordWindow() {
-    HWND hWnd = nullptr;
-    EnumData data = { nullptr, GetCurrentProcessId() };
-    EnumWindows(FindDiscordWindowProc, (LPARAM)&data);
-    hWnd = data.result;
-    if (!hWnd) hWnd = FindWindowW(L"Discord", nullptr);
-    if (!hWnd) return;
-
-    if (IsIconic(hWnd))
-        ShowWindow(hWnd, SW_RESTORE);
-
-    INPUT inputs[2] = {};
-    inputs[0].type = INPUT_KEYBOARD;
-    inputs[0].ki.wVk = VK_MENU;
-    inputs[1].type = INPUT_KEYBOARD;
-    inputs[1].ki.wVk = VK_MENU;
-    inputs[1].ki.dwFlags = KEYEVENTF_KEYUP;
-    SendInput(2, inputs, sizeof(INPUT));
-
-    SetForegroundWindow(hWnd);
+    WCHAR discordPath[MAX_PATH] = {};
+    
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe = {};
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(hSnap, &pe)) {
+            do {
+                if (_wcsicmp(pe.szExeFile, L"Discord.exe") == 0) {
+                    HANDLE hProc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+                    if (hProc) {
+                        DWORD pathSize = MAX_PATH;
+                        if (QueryFullProcessImageNameW(hProc, 0, discordPath, &pathSize)) {
+                            CloseHandle(hProc);
+                            break;
+                        }
+                        CloseHandle(hProc);
+                    }
+                }
+            } while (Process32NextW(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+    }
+    
+    if (discordPath[0]) {
+        Wh_Log(L"Launching Discord: %s", discordPath);
+        ShellExecuteW(nullptr, nullptr, discordPath, nullptr, nullptr, SW_SHOWNORMAL);
+    } else {
+        // Fallback: try common paths or just "Discord"
+        Wh_Log(L"Discord path not found, trying shell launch");
+        ShellExecuteW(nullptr, nullptr, L"Discord", nullptr, nullptr, SW_SHOWNORMAL);
+    }
 }
 
 // Tray Constructor
-
 #define WM_BALLOON_SHOW   (WM_USER + 300)
 #define WM_TRAY_CALLBACK  (WM_USER + 200)
 #define WM_CHECK_DISCORD  (WM_USER + 301)
+#define WM_ADD_TRAY_ICON  (WM_USER + 302)
 
 static HWND g_hBalloonWnd = nullptr;
 static bool g_iconAdded = false;
 static CRITICAL_SECTION g_cs;
 static HICON g_hAppIcon = nullptr;
 static HANDLE g_hThread = nullptr;
+static UINT g_wmTaskbarCreated = 0;
 
 static WCHAR g_pendingTitle[256] = {};
 static WCHAR g_pendingBody[512] = {};
@@ -186,25 +185,67 @@ static WCHAR g_pendingBody[512] = {};
 // PFP icon
 static WCHAR g_lastImagePath[MAX_PATH] = {};
 static HICON g_lastNotifIcon = nullptr;
-
-static void RemoveTrayIcon();
+// Mutex to ensure only one tray icon across all Discord processes
+static HANDLE g_hTrayMutex = nullptr;
+static bool g_ownsTray = false;
+static const WCHAR* TRAY_MUTEX_NAME = L"Local\\WindhawkDiscordBalloonTrayMutex";
 
 static void EnsureTrayIcon() {
-    if (g_iconAdded || !g_hBalloonWnd) return;
-
-    NOTIFYICONDATAW nid = {};
-    nid.cbSize = sizeof(nid);
+    if (!g_hBalloonWnd) return;
+    if (g_iconAdded) return;
+    if (!IsAnyDiscordRunning()) return;
+    
+    // Only one process creates the tray icon
+    if (!g_ownsTray) {
+        if (!g_hTrayMutex) {
+            g_hTrayMutex = CreateMutexW(nullptr, FALSE, TRAY_MUTEX_NAME);
+            if (!g_hTrayMutex) return;
+        }
+        
+        DWORD result = WaitForSingleObject(g_hTrayMutex, 0);
+        if (result == WAIT_OBJECT_0 || result == WAIT_ABANDONED) {
+            g_ownsTray = true;
+            Wh_Log(L"Acquired tray mutex (PID %lu)", GetCurrentProcessId());
+        } else {
+            // Another process owns it, don't create icon
+            return;
+        }
+    }
+    
+    // Check if icon already exists (another process might have created it)
+    NOTIFYICONDATAW nidCheck = {};
+    nidCheck.cbSize = sizeof(nidCheck);
+    nidCheck.hWnd = g_hBalloonWnd;
+    nidCheck.uID = 1;
+    nidCheck.uFlags = NIF_STATE;
+    
+    // Small delay to prevent race condition on first notification
+    static bool s_firstTime = true;
+    if (s_firstTime) {
+        s_firstTime = false;
+        Sleep(100);
+    }
+    
+    NOTIFYICONDATAW nid;
+    ZeroMemory(&nid, sizeof(nid));
+    nid.cbSize = sizeof(NOTIFYICONDATAW);
     nid.hWnd = g_hBalloonWnd;
     nid.uID = 1;
-    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
     nid.uCallbackMessage = WM_TRAY_CALLBACK;
     nid.hIcon = g_hAppIcon ? g_hAppIcon : LoadIconW(nullptr, IDI_APPLICATION);
-    wcscpy_s(nid.szTip, L"Discord");
+    wcsncpy(nid.szTip, L"Discord", ARRAYSIZE(nid.szTip) - 1);
+    nid.szTip[ARRAYSIZE(nid.szTip) - 1] = L'\0';
 
     if (Shell_NotifyIconW(NIM_ADD, &nid)) {
         g_iconAdded = true;
         nid.uVersion = NOTIFYICON_VERSION_4;
         Shell_NotifyIconW(NIM_SETVERSION, &nid);
+        Wh_Log(L"Tray icon added (owner PID %lu)", GetCurrentProcessId());
+    } else {
+        // Icon might already exist, try modify instead
+        DWORD err = GetLastError();
+        Wh_Log(L"NIM_ADD failed (error %lu), trying NIM_MODIFY", err);
     }
 }
 
@@ -215,8 +256,6 @@ typedef void (__stdcall *GdiplusShutdown_t)(ULONG_PTR);
 typedef int (__stdcall *GdipCreateBitmapFromFile_t)(const WCHAR*, void**);
 typedef int (__stdcall *GdipCreateHICONFromBitmap_t)(void*, HICON*);
 typedef int (__stdcall *GdipDisposeImage_t)(void*);
-typedef int (__stdcall *GdipGetImageWidth_t)(void*, UINT*);
-typedef int (__stdcall *GdipGetImageHeight_t)(void*, UINT*);
 typedef int (__stdcall *GdipCreateBitmapFromScan0_t)(INT, INT, INT, INT, BYTE*, void**);
 typedef int (__stdcall *GdipGetImageGraphicsContext_t)(void*, void**);
 typedef int (__stdcall *GdipDrawImageRectI_t)(void*, void*, INT, INT, INT, INT);
@@ -228,10 +267,7 @@ static HICON LoadPngAsIcon(const WCHAR* path, int targetSize, int drawSize, int 
     if (!path || !path[0]) return nullptr;
 
     DWORD attrs = GetFileAttributesW(path);
-    if (attrs == INVALID_FILE_ATTRIBUTES) {
-        Wh_Log(L"Image file not found: %s", path);
-        return nullptr;
-    }
+    if (attrs == INVALID_FILE_ATTRIBUTES) return nullptr;
 
     HMODULE hGdiPlus = LoadLibraryW(L"gdiplus.dll");
     if (!hGdiPlus) return nullptr;
@@ -272,8 +308,6 @@ static HICON LoadPngAsIcon(const WCHAR* path, int targetSize, int drawSize, int 
             if (pGetGfx(pTarget, &pGfx) == 0 && pGfx) {
                 if (pClear) pClear(pGfx, 0x00000000);
                 if (pSetInterp) pSetInterp(pGfx, 7);
-
-                // Draw the source image scaled to drawSize at offset position
                 pDrawRect(pGfx, pBitmap, offsetX, offsetY, drawSize, drawSize);
                 pDelGfx(pGfx);
             }
@@ -291,11 +325,35 @@ static HICON LoadPngAsIconSimple(const WCHAR* path, int size) {
     return LoadPngAsIcon(path, size, size, 0, 0);
 }
 
+// Ellipsis helper
+
+static void TruncateWithEllipsis(WCHAR* dest, const WCHAR* src, int maxLen) {
+    if (!dest || !src || maxLen <= 0) return;
+    
+    int srcLen = (int)wcslen(src);
+    if (srcLen <= maxLen) {
+        wcsncpy(dest, src, maxLen);
+        dest[MIN_VAL(srcLen, maxLen)] = L'\0';
+    } else {
+        if (maxLen <= 3) {
+            for (int i = 0; i < maxLen; i++) dest[i] = L'.';
+            dest[maxLen] = L'\0';
+        } else {
+            wcsncpy(dest, src, maxLen - 3);
+            dest[maxLen - 3] = L'.';
+            dest[maxLen - 2] = L'.';
+            dest[maxLen - 1] = L'.';
+            dest[maxLen] = L'\0';
+        }
+    }
+}
+
 // Balloon Constructor
 
 static void DoShowBalloon(const WCHAR* title, const WCHAR* body) {
     if (!g_hBalloonWnd) return;
     EnsureTrayIcon();
+    if (!g_iconAdded || !g_ownsTray) return;
 
     if (g_lastNotifIcon) {
         DestroyIcon(g_lastNotifIcon);
@@ -311,54 +369,45 @@ static void DoShowBalloon(const WCHAR* title, const WCHAR* body) {
                 g_lastNotifIcon = LoadPngAsIconSimple(g_lastImagePath, 16);
                 useLargeIconFlag = false;
                 break;
-                
             case ICON_SIZE_MEDIUM:
                 g_lastNotifIcon = LoadPngAsIcon(g_lastImagePath, 32, 24, 4, 0);
                 useLargeIconFlag = true;
                 break;
-                
             case ICON_SIZE_LARGE:
             default:
                 g_lastNotifIcon = LoadPngAsIconSimple(g_lastImagePath, 32);
                 useLargeIconFlag = true;
                 break;
         }
-        
-        if (g_lastNotifIcon) {
-            useCustomIcon = true;
-            //Wh_Log(L"Loaded PFP icon (mode=%d) from %s", g_settings.iconSize, g_lastImagePath);
-        }
+        if (g_lastNotifIcon) useCustomIcon = true;
     }
 
-    NOTIFYICONDATAW nid = {};
-    nid.cbSize = sizeof(nid);
+    NOTIFYICONDATAW nid;
+    ZeroMemory(&nid, sizeof(nid));
+    nid.cbSize = sizeof(NOTIFYICONDATAW);
     nid.hWnd = g_hBalloonWnd;
     nid.uID = 1;
-    nid.uFlags = NIF_INFO;
+    nid.uFlags = NIF_INFO | NIF_TIP | NIF_SHOWTIP;
+    wcsncpy(nid.szTip, L"Discord", ARRAYSIZE(nid.szTip) - 1);
+    nid.szTip[ARRAYSIZE(nid.szTip) - 1] = L'\0';
 
     if (useCustomIcon) {
         nid.dwInfoFlags = NIIF_USER;
-        if (useLargeIconFlag) {
-            nid.dwInfoFlags |= NIIF_LARGE_ICON;
-        }
+        if (useLargeIconFlag) nid.dwInfoFlags |= NIIF_LARGE_ICON;
         nid.hBalloonIcon = g_lastNotifIcon;
     } else {
         nid.dwInfoFlags = NIIF_INFO;
     }
 
-    wcsncpy(nid.szInfoTitle,
+    TruncateWithEllipsis(nid.szInfoTitle,
         (title && title[0]) ? title : L"Discord",
         ARRAYSIZE(nid.szInfoTitle) - 1);
-    wcsncpy(nid.szInfo,
+    TruncateWithEllipsis(nid.szInfo,
         (body && body[0]) ? body : L"New message",
         ARRAYSIZE(nid.szInfo) - 1);
 
     Shell_NotifyIconW(NIM_MODIFY, &nid);
-    Wh_Log(L"Balloon: \"%s\" - \"%s\" (icon=%s, mode=%d, largeFlag=%s)",
-        nid.szInfoTitle, nid.szInfo,
-        useCustomIcon ? L"PFP" : L"default",
-        g_settings.iconSize,
-        useLargeIconFlag ? L"yes" : L"no");
+    Wh_Log(L"Balloon: \"%s\" - \"%s\"", nid.szInfoTitle, nid.szInfo);
 }
 
 static void ShowBalloonNotification(const WCHAR* title, const WCHAR* body) {
@@ -372,7 +421,7 @@ static void ShowBalloonNotification(const WCHAR* title, const WCHAR* body) {
 }
 
 static void RemoveTrayIcon() {
-    if (g_iconAdded && g_hBalloonWnd) {
+    if (g_iconAdded && g_hBalloonWnd && g_ownsTray) {
         NOTIFYICONDATAW nid = {};
         nid.cbSize = sizeof(nid);
         nid.hWnd = g_hBalloonWnd;
@@ -381,9 +430,50 @@ static void RemoveTrayIcon() {
         g_iconAdded = false;
         Wh_Log(L"Tray icon removed");
     }
+    if (g_ownsTray && g_hTrayMutex) {
+        ReleaseMutex(g_hTrayMutex);
+        g_ownsTray = false;
+    }
 }
 
 static LRESULT CALLBACK BalloonWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (g_wmTaskbarCreated && msg == g_wmTaskbarCreated) {
+        Wh_Log(L">>> TaskbarCreated received! Explorer restarted. g_ownsTray=%d g_iconAdded=%d", 
+               g_ownsTray, g_iconAdded);
+        g_iconAdded = false;
+        // Delay to let explorer fully initialize
+        SetTimer(hWnd, 1, 2000, nullptr);
+        return 0;
+    }
+    
+    if (msg == WM_TIMER && wParam == 1) {
+        KillTimer(hWnd, 1);
+        if (g_ownsTray && IsAnyDiscordRunning() && !g_iconAdded) {
+            Wh_Log(L"Re-adding tray icon after explorer restart");
+            
+            NOTIFYICONDATAW nid;
+            ZeroMemory(&nid, sizeof(nid));
+            nid.cbSize = sizeof(NOTIFYICONDATAW);
+            nid.hWnd = g_hBalloonWnd;
+            nid.uID = 1;
+            nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+            nid.uCallbackMessage = WM_TRAY_CALLBACK;
+            nid.hIcon = g_hAppIcon ? g_hAppIcon : LoadIconW(nullptr, IDI_APPLICATION);
+            wcsncpy(nid.szTip, L"Discord", ARRAYSIZE(nid.szTip) - 1);
+            nid.szTip[ARRAYSIZE(nid.szTip) - 1] = L'\0';
+
+            if (Shell_NotifyIconW(NIM_ADD, &nid)) {
+                g_iconAdded = true;
+                nid.uVersion = NOTIFYICON_VERSION_4;
+                Shell_NotifyIconW(NIM_SETVERSION, &nid);
+                Wh_Log(L"Tray icon restored after explorer restart");
+            } else {
+                Wh_Log(L"Failed to restore tray icon, will retry via monitor thread");
+            }
+        }
+        return 0;
+    }
+
     if (msg == WM_BALLOON_SHOW) {
         WCHAR title[256], body[512];
         EnterCriticalSection(&g_cs);
@@ -406,9 +496,14 @@ static LRESULT CALLBACK BalloonWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
     }
     
     if (msg == WM_CHECK_DISCORD) {
-        if (!IsAnyDiscordRunning()) {
-            Wh_Log(L"No Discord processes found, removing tray icon");
-            RemoveTrayIcon();
+        // Tray icon will be created when first notification arrives or by monitor thread
+        Wh_Log(L"Balloon thread started (PID %lu)", GetCurrentProcessId());
+        return 0;
+    }
+    
+    if (msg == WM_ADD_TRAY_ICON) {
+        if (!g_iconAdded) {
+            EnsureTrayIcon();
         }
         return 0;
     }
@@ -417,33 +512,120 @@ static LRESULT CALLBACK BalloonWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
 }
 
 static DWORD WINAPI DiscordMonitorThread(LPVOID) {
-    Wh_Log(L"Discord monitor thread started");
+    DWORD lastExplorerPid = 0;
     
-    while (!g_stopMonitor) {
-        Sleep(2000); // Check every 2 seconds
-        
-        if (g_stopMonitor) break;
-        
-        if (g_iconAdded && g_hBalloonWnd) {
-            PostMessageW(g_hBalloonWnd, WM_CHECK_DISCORD, 0, 0);
-        }
+    // Get initial explorer PID
+    HWND hTray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (hTray) {
+        GetWindowThreadProcessId(hTray, &lastExplorerPid);
     }
     
-    Wh_Log(L"Discord monitor thread stopped");
+    while (!g_stopMonitor) {
+        Sleep(1000);  // Check every second
+        if (g_stopMonitor) break;
+        
+        if (g_hBalloonWnd) {
+            bool discordRunning = IsAnyDiscordRunning();
+            
+            // Check if explorer restarted by comparing Shell_TrayWnd PID
+            HWND hTrayNow = FindWindowW(L"Shell_TrayWnd", nullptr);
+            DWORD currentExplorerPid = 0;
+            if (hTrayNow) {
+                GetWindowThreadProcessId(hTrayNow, &currentExplorerPid);
+            }
+            
+            if (currentExplorerPid != 0 && lastExplorerPid != 0 && 
+                currentExplorerPid != lastExplorerPid) {
+                // Explorer restarted!
+                Wh_Log(L"Detected explorer restart (PID %lu -> %lu)", 
+                       lastExplorerPid, currentExplorerPid);
+                g_iconAdded = false;
+                lastExplorerPid = currentExplorerPid;
+                
+                // Wait a bit for explorer to fully initialize
+                Sleep(2000);
+            }
+            
+            if (hTrayNow && lastExplorerPid == 0) {
+                lastExplorerPid = currentExplorerPid;
+            }
+            
+            if (g_ownsTray) {
+                if (!discordRunning) {
+                    PostMessageW(g_hBalloonWnd, WM_CHECK_DISCORD, 0, 0);
+                } else if (!g_iconAdded) {
+                    Wh_Log(L"Tray owner but icon not added, re-adding...");
+                    PostMessageW(g_hBalloonWnd, WM_ADD_TRAY_ICON, 0, 0);
+                }
+            } else {
+                if (discordRunning) {
+                    PostMessageW(g_hBalloonWnd, WM_ADD_TRAY_ICON, 0, 0);
+                }
+            }
+        }
+    }
     return 0;
 }
 
 static DWORD WINAPI BalloonThread(LPVOID) {
+    g_wmTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    Wh_Log(L"Registered TaskbarCreated message: %u", g_wmTaskbarCreated);
+    
     WNDCLASSW wc = {};
     wc.lpfnWndProc = BalloonWndProc;
     wc.hInstance = GetModuleHandleW(nullptr);
     wc.lpszClassName = L"WindhawkDiscordBalloonClass";
     RegisterClassW(&wc);
 
-    g_hBalloonWnd = CreateWindowExW(0, wc.lpszClassName, L"", 0,
-        0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+    g_hBalloonWnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW,  // Don't show in taskbar
+        wc.lpszClassName, 
+        L"", 
+        WS_POPUP,  // No frame
+        0, 0, 0, 0,  // Zero size = invisible
+        nullptr,  // No parent (NOT HWND_MESSAGE)
+        nullptr, 
+        wc.hInstance, 
+        nullptr);
 
-    if (!g_hBalloonWnd) return 1;
+    if (!g_hBalloonWnd) {
+        Wh_Log(L"Failed to create balloon window");
+        return 1;
+    }
+    
+    Wh_Log(L"Balloon window created: %p", g_hBalloonWnd);
+    
+    // Allow TaskbarCreated message through UIPI
+    if (g_wmTaskbarCreated) {
+        typedef BOOL (WINAPI *ChangeWindowMessageFilter_t)(UINT, DWORD);
+        typedef BOOL (WINAPI *ChangeWindowMessageFilterEx_t)(HWND, UINT, DWORD, void*);
+        
+        HMODULE hUser32 = GetModuleHandleW(L"user32.dll");
+        if (hUser32) {
+            // Try ChangeWindowMessageFilterEx first
+            auto pChangeFilterEx = (ChangeWindowMessageFilterEx_t)GetProcAddress(hUser32, "ChangeWindowMessageFilterEx");
+            if (pChangeFilterEx) {
+                if (pChangeFilterEx(g_hBalloonWnd, g_wmTaskbarCreated, 1 /*MSGFLT_ALLOW*/, nullptr)) {
+                    Wh_Log(L"ChangeWindowMessageFilterEx succeeded");
+                } else {
+                    Wh_Log(L"ChangeWindowMessageFilterEx failed: %lu", GetLastError());
+                }
+            }
+            
+            // Also try the process-wide filter
+            auto pChangeFilter = (ChangeWindowMessageFilter_t)GetProcAddress(hUser32, "ChangeWindowMessageFilter");
+            if (pChangeFilter) {
+                if (pChangeFilter(g_wmTaskbarCreated, 1 /*MSGFLT_ADD*/)) {
+                    Wh_Log(L"ChangeWindowMessageFilter succeeded");
+                } else {
+                    Wh_Log(L"ChangeWindowMessageFilter failed: %lu", GetLastError());
+                }
+            }
+        }
+    }
+
+    // Tray icon will be created when first notification arrives or by monitor thread
+    Wh_Log(L"Balloon thread started (PID %lu)", GetCurrentProcessId());
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -503,6 +685,596 @@ static void DecodeXmlEntities(WCHAR* str) {
     *write = L'\0';
 }
 
+// Emoji to Discord name mapping
+
+struct DynamicEmojiEntry {
+    WCHAR surrogates[16];  // The actual emoji Unicode string
+    WCHAR name[64];        // Discord shortcode like ":smile:"
+};
+
+#define MAX_EMOJI_ENTRIES 8192
+
+static DynamicEmojiEntry* g_dynamicEmojiTable = nullptr;
+static volatile LONG g_emojiCount = 0;
+static volatile LONG g_emojiTableReady = 0;
+
+// Cache file path
+static WCHAR g_emojiCachePath[MAX_PATH] = {};
+
+static void GetEmojiCachePath() {
+    WCHAR winDir[MAX_PATH];
+    GetWindowsDirectoryW(winDir, MAX_PATH);
+    swprintf_s(g_emojiCachePath, L"%s\\Temp\\windhawk_discord_emojis.json", winDir);
+}
+
+// Download the JSON file from GitHub
+static char* DownloadEmojiJson(DWORD* outSize) {
+    *outSize = 0;
+    
+    HINTERNET hInternet = InternetOpenW(L"WindhawkDiscordBalloon/1.0",
+        INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    if (!hInternet) return nullptr;
+    
+    HINTERNET hUrl = InternetOpenUrlW(hInternet,
+        L"https://raw.githubusercontent.com/repensky/local-wh-mods/refs/heads/main/discord-emojis.json",
+        nullptr, 0,
+        INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE,
+        0);
+    
+    if (!hUrl) {
+        InternetCloseHandle(hInternet);
+        return nullptr;
+    }
+    
+    DWORD capacity = 256 * 1024;
+    char* buf = (char*)HeapAlloc(GetProcessHeap(), 0, capacity);
+    if (!buf) {
+        InternetCloseHandle(hUrl);
+        InternetCloseHandle(hInternet);
+        return nullptr;
+    }
+    
+    DWORD totalRead = 0;
+    DWORD bytesRead;
+    char tmp[8192];
+    while (InternetReadFile(hUrl, tmp, sizeof(tmp), &bytesRead) && bytesRead > 0) {
+        if (totalRead + bytesRead >= capacity) {
+            capacity *= 2;
+            char* newBuf = (char*)HeapReAlloc(GetProcessHeap(), 0, buf, capacity);
+            if (!newBuf) { HeapFree(GetProcessHeap(), 0, buf); buf = nullptr; break; }
+            buf = newBuf;
+        }
+        if (buf) {
+            memcpy(buf + totalRead, tmp, bytesRead);
+            totalRead += bytesRead;
+        }
+    }
+    
+    InternetCloseHandle(hUrl);
+    InternetCloseHandle(hInternet);
+    
+    if (buf) {
+        buf[totalRead] = '\0';
+        *outSize = totalRead;
+        Wh_Log(L"Downloaded emoji JSON: %lu bytes", totalRead);
+    }
+    return buf;
+}
+
+static void SaveEmojiCache(const char* json, DWORD size) {
+    if (g_emojiCachePath[0] == L'\0' || !json) return;
+    HANDLE hFile = CreateFileW(g_emojiCachePath, GENERIC_WRITE, 0, nullptr,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile != INVALID_HANDLE_VALUE) {
+        DWORD written;
+        WriteFile(hFile, json, size, &written, nullptr);
+        CloseHandle(hFile);
+    }
+}
+
+static char* LoadEmojiCache(DWORD* outSize) {
+    *outSize = 0;
+    if (g_emojiCachePath[0] == L'\0') return nullptr;
+    HANDLE hFile = CreateFileW(g_emojiCachePath, GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (hFile == INVALID_HANDLE_VALUE) return nullptr;
+    DWORD fileSize = GetFileSize(hFile, nullptr);
+    if (fileSize == 0 || fileSize > 10 * 1024 * 1024) {
+        CloseHandle(hFile);
+        return nullptr;
+    }
+    char* buf = (char*)HeapAlloc(GetProcessHeap(), 0, fileSize + 1);
+    if (!buf) { CloseHandle(hFile); return nullptr; }
+    DWORD bytesRead;
+    if (!ReadFile(hFile, buf, fileSize, &bytesRead, nullptr)) {
+        HeapFree(GetProcessHeap(), 0, buf);
+        CloseHandle(hFile);
+        return nullptr;
+    }
+    CloseHandle(hFile);
+    buf[bytesRead] = '\0';
+    *outSize = bytesRead;
+    return buf;
+}
+
+static bool IsEmojiCacheFresh() {
+    if (g_emojiCachePath[0] == L'\0') return false;
+    WIN32_FILE_ATTRIBUTE_DATA attrs;
+    if (!GetFileAttributesExW(g_emojiCachePath, GetFileExInfoStandard, &attrs)) return false;
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    ULARGE_INTEGER fileTime, currentTime;
+    fileTime.LowPart = attrs.ftLastWriteTime.dwLowDateTime;
+    fileTime.HighPart = attrs.ftLastWriteTime.dwHighDateTime;
+    currentTime.LowPart = now.dwLowDateTime;
+    currentTime.HighPart = now.dwHighDateTime;
+    ULONGLONG sevenDays = (ULONGLONG)7 * 24 * 60 * 60 * 10000000ULL;
+    return (currentTime.QuadPart - fileTime.QuadPart) < sevenDays;
+}
+
+// UTF-8 decode helper: decode one codepoint from UTF-8, advance pointer
+static unsigned int DecodeUtf8Char(const char*& p) {
+    unsigned char c = (unsigned char)*p;
+    unsigned int cp = 0;
+    if (c < 0x80) {
+        cp = c; p++;
+    } else if ((c & 0xE0) == 0xC0) {
+        cp = c & 0x1F;
+        cp = (cp << 6) | ((unsigned char)p[1] & 0x3F);
+        p += 2;
+    } else if ((c & 0xF0) == 0xE0) {
+        cp = c & 0x0F;
+        cp = (cp << 6) | ((unsigned char)p[1] & 0x3F);
+        cp = (cp << 6) | ((unsigned char)p[2] & 0x3F);
+        p += 3;
+    } else if ((c & 0xF8) == 0xF0) {
+        cp = c & 0x07;
+        cp = (cp << 6) | ((unsigned char)p[1] & 0x3F);
+        cp = (cp << 6) | ((unsigned char)p[2] & 0x3F);
+        cp = (cp << 6) | ((unsigned char)p[3] & 0x3F);
+        p += 4;
+    } else {
+        p++;
+    }
+    return cp;
+}
+
+// Write a Unicode codepoint as UTF-16 into a WCHAR buffer, return chars written
+static int CodepointToUtf16(unsigned int cp, WCHAR* out) {
+    if (cp <= 0xFFFF) {
+        out[0] = (WCHAR)cp;
+        return 1;
+    } else if (cp <= 0x10FFFF) {
+        cp -= 0x10000;
+        out[0] = (WCHAR)(0xD800 | (cp >> 10));
+        out[1] = (WCHAR)(0xDC00 | (cp & 0x3FF));
+        return 2;
+    }
+    return 0;
+}
+
+// Convert a UTF-8 JSON string value to UTF-16, handling \uXXXX escapes
+// src points AFTER the opening quote, we read until closing quote
+static bool JsonStringToWide(const char*& p, WCHAR* out, int outMax) {
+    int pos = 0;
+    // p should be right after opening "
+    while (*p && *p != '"' && pos < outMax - 2) {
+        if (*p == '\\') {
+            p++;
+            switch (*p) {
+                case '"': out[pos++] = L'"'; p++; break;
+                case '\\': out[pos++] = L'\\'; p++; break;
+                case '/': out[pos++] = L'/'; p++; break;
+                case 'n': out[pos++] = L'\n'; p++; break;
+                case 'r': out[pos++] = L'\r'; p++; break;
+                case 't': out[pos++] = L'\t'; p++; break;
+                case 'u': {
+                    p++;  // skip 'u'
+                    char hex[5] = {};
+                    for (int i = 0; i < 4 && *p; i++) hex[i] = *p++;
+                    unsigned long val = strtoul(hex, nullptr, 16);
+                    
+                    // Check for surrogate pair
+                    if (val >= 0xD800 && val <= 0xDBFF && p[0] == '\\' && p[1] == 'u') {
+                        p += 2;  // skip \u
+                        char hex2[5] = {};
+                        for (int i = 0; i < 4 && *p; i++) hex2[i] = *p++;
+                        unsigned long val2 = strtoul(hex2, nullptr, 16);
+                        if (val2 >= 0xDC00 && val2 <= 0xDFFF) {
+                            out[pos++] = (WCHAR)val;
+                            if (pos < outMax - 1) out[pos++] = (WCHAR)val2;
+                        } else {
+                            // Not a valid pair, emit first and rewind
+                            int w = CodepointToUtf16((unsigned int)val, out + pos);
+                            pos += w;
+                        }
+                    } else {
+                        int w = CodepointToUtf16((unsigned int)val, out + pos);
+                        pos += w;
+                    }
+                    break;
+                }
+                default: out[pos++] = (WCHAR)*p; p++; break;
+            }
+        } else {
+            // Raw UTF-8 byte(s) -> decode to codepoint -> encode as UTF-16
+            unsigned int cp = DecodeUtf8Char(p);
+            int w = CodepointToUtf16(cp, out + pos);
+            pos += w;
+        }
+    }
+    if (*p == '"') p++;  // skip closing quote
+    out[pos] = L'\0';
+    return pos > 0;
+}
+
+// Skip a JSON value (string, number, object, array, bool, null)
+static void SkipJsonValue(const char*& p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p == '"') {
+        p++;  // skip opening quote
+        while (*p && *p != '"') {
+            if (*p == '\\') { p++; if (*p) p++; }
+            else p++;
+        }
+        if (*p == '"') p++;
+    } else if (*p == '[') {
+        int depth = 1; p++;
+        while (*p && depth > 0) {
+            if (*p == '[') depth++;
+            else if (*p == ']') depth--;
+            else if (*p == '"') { p++; while (*p && *p != '"') { if (*p == '\\') { p++; if (*p) p++; } else p++; } if (*p == '"') p++; continue; }
+            p++;
+        }
+    } else if (*p == '{') {
+        int depth = 1; p++;
+        while (*p && depth > 0) {
+            if (*p == '{') depth++;
+            else if (*p == '}') depth--;
+            else if (*p == '"') { p++; while (*p && *p != '"') { if (*p == '\\') { p++; if (*p) p++; } else p++; } if (*p == '"') p++; continue; }
+            p++;
+        }
+    } else {
+        while (*p && *p != ',' && *p != '}' && *p != ']') p++;
+    }
+}
+
+static void ParseEmojiJson(const char* json, DWORD jsonSize) {
+    if (!json || !g_dynamicEmojiTable) return;
+    
+    // Find "emojis" key
+    const char* p = strstr(json, "\"emojis\"");
+    if (!p) { Wh_Log(L"No 'emojis' key in JSON"); return; }
+    
+    p += 8;  // skip "emojis"
+    while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '[') { Wh_Log(L"Expected '[' after emojis"); return; }
+    p++;  // skip '['
+    
+    LONG count = 0;
+    
+    while (*p && count < MAX_EMOJI_ENTRIES) {
+        while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+        if (*p == ']') break;
+        if (*p != '{') { p++; continue; }
+        p++;  // skip '{'
+        
+        WCHAR firstName[64] = {};
+        WCHAR surrogates[16] = {};
+        bool gotName = false;
+        bool gotSurrogates = false;
+        
+        while (*p && *p != '}') {
+            while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == ',') p++;
+            if (*p == '}') break;
+            
+            // Parse key
+            if (*p != '"') { p++; continue; }
+            p++;  // skip opening quote
+            
+            // Read key name inline
+            char key[32] = {};
+            int ki = 0;
+            while (*p && *p != '"' && ki < 30) {
+                if (*p == '\\') { p++; if (*p) key[ki++] = *p++; }
+                else key[ki++] = *p++;
+            }
+            key[ki] = '\0';
+            if (*p == '"') p++;
+            
+            while (*p == ' ' || *p == ':' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+            
+            if (strcmp(key, "names") == 0) {
+                // Parse array, grab first name only
+                if (*p == '[') {
+                    p++;
+                    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+                    if (*p == '"') {
+                        p++;  // skip opening quote
+                        // Read name chars as ASCII into firstName
+                        int ni = 0;
+                        while (*p && *p != '"' && ni < 62) {
+                            if (*p == '\\') { p++; if (*p) firstName[ni++] = (WCHAR)*p++; }
+                            else firstName[ni++] = (WCHAR)*p++;
+                        }
+                        firstName[ni] = L'\0';
+                        if (*p == '"') p++;
+                        gotName = (ni > 0);
+                    }
+                    // Skip rest of array
+                    int depth = 1;
+                    while (*p && depth > 0) {
+                        if (*p == '[') depth++;
+                        else if (*p == ']') depth--;
+                        else if (*p == '"') { p++; while (*p && *p != '"') { if (*p == '\\') { p++; if (*p) p++; } else p++; } if (*p == '"') p++; continue; }
+                        p++;
+                    }
+                } else {
+                    SkipJsonValue(p);
+                }
+            } else if (strcmp(key, "surrogates") == 0) {
+                if (*p == '"') {
+                    p++;  // skip opening quote
+                    gotSurrogates = JsonStringToWide(p, surrogates, ARRAYSIZE(surrogates));
+                } else {
+                    SkipJsonValue(p);
+                }
+            } else {
+                SkipJsonValue(p);
+            }
+        }
+        if (*p == '}') p++;
+        
+        if (gotName && gotSurrogates && surrogates[0] && firstName[0]) {
+            DynamicEmojiEntry& e = g_dynamicEmojiTable[count];
+            wcscpy_s(e.surrogates, surrogates);
+            // Format as :name:
+            swprintf_s(e.name, L":%s:", firstName);
+            count++;
+        }
+    }
+    
+    // Sort by surrogate length descending (simple bubble sort, runs once)
+    for (LONG i = 0; i < count - 1; i++) {
+        for (LONG j = 0; j < count - 1 - i; j++) {
+            if (wcslen(g_dynamicEmojiTable[j].surrogates) < wcslen(g_dynamicEmojiTable[j+1].surrogates)) {
+                DynamicEmojiEntry tmp = g_dynamicEmojiTable[j];
+                g_dynamicEmojiTable[j] = g_dynamicEmojiTable[j+1];
+                g_dynamicEmojiTable[j+1] = tmp;
+            }
+        }
+    }
+    
+    // Use InterlockedExchange to ensure visibility
+    InterlockedExchange(&g_emojiCount, count);
+    InterlockedExchange(&g_emojiTableReady, 1);
+    Wh_Log(L"Loaded %ld emoji entries from JSON", count);
+}
+
+static const WCHAR* EMOJI_DOWNLOAD_MUTEX_NAME = L"Global\\WindhawkDiscordEmojiDownload";
+
+static DWORD WINAPI EmojiLoadThread(LPVOID) {
+    GetEmojiCachePath();
+    
+    char* json = nullptr;
+    DWORD jsonSize = 0;
+    
+    // Try fresh cache first - no lock needed for reading
+    if (IsEmojiCacheFresh()) {
+        json = LoadEmojiCache(&jsonSize);
+        if (json && jsonSize > 0) {
+            ParseEmojiJson(json, jsonSize);
+            HeapFree(GetProcessHeap(), 0, json);
+            return 0;
+        }
+        if (json) HeapFree(GetProcessHeap(), 0, json);
+    }
+    
+    // Need to download - use a named mutex so only one process downloads
+    HANDLE hDownloadMutex = CreateMutexW(nullptr, FALSE, EMOJI_DOWNLOAD_MUTEX_NAME);
+    if (!hDownloadMutex) {
+        // Can't create mutex, try stale cache
+        json = LoadEmojiCache(&jsonSize);
+        if (json && jsonSize > 0) {
+            ParseEmojiJson(json, jsonSize);
+            HeapFree(GetProcessHeap(), 0, json);
+        } else if (json) {
+            HeapFree(GetProcessHeap(), 0, json);
+        }
+        return 0;
+    }
+    
+    DWORD waitResult = WaitForSingleObject(hDownloadMutex, 30000);  // 30s timeout
+    
+    if (waitResult == WAIT_OBJECT_0 || waitResult == WAIT_ABANDONED) {
+        // We got the lock - check if another process already downloaded while we waited
+        if (IsEmojiCacheFresh()) {
+            json = LoadEmojiCache(&jsonSize);
+            if (json && jsonSize > 0) {
+                Wh_Log(L"Another process already downloaded emoji cache");
+                ParseEmojiJson(json, jsonSize);
+                HeapFree(GetProcessHeap(), 0, json);
+                ReleaseMutex(hDownloadMutex);
+                CloseHandle(hDownloadMutex);
+                return 0;
+            }
+            if (json) HeapFree(GetProcessHeap(), 0, json);
+        }
+        
+        // We're the one to download
+        Wh_Log(L"Downloading emoji JSON (PID %lu)", GetCurrentProcessId());
+        json = DownloadEmojiJson(&jsonSize);
+        if (json && jsonSize > 0) {
+            SaveEmojiCache(json, jsonSize);
+            ParseEmojiJson(json, jsonSize);
+            HeapFree(GetProcessHeap(), 0, json);
+        } else {
+            if (json) HeapFree(GetProcessHeap(), 0, json);
+            // Fallback to stale cache
+            json = LoadEmojiCache(&jsonSize);
+            if (json && jsonSize > 0) {
+                Wh_Log(L"Using stale emoji cache as fallback");
+                ParseEmojiJson(json, jsonSize);
+                HeapFree(GetProcessHeap(), 0, json);
+            } else {
+                Wh_Log(L"No emoji data available");
+                if (json) HeapFree(GetProcessHeap(), 0, json);
+            }
+        }
+        
+        ReleaseMutex(hDownloadMutex);
+    } else {
+        // Timeout or error - another process is probably downloading, wait and use cache
+        Wh_Log(L"Emoji download mutex timeout, waiting for cache...");
+        Sleep(5000);
+        json = LoadEmojiCache(&jsonSize);
+        if (json && jsonSize > 0) {
+            ParseEmojiJson(json, jsonSize);
+            HeapFree(GetProcessHeap(), 0, json);
+        } else {
+            Wh_Log(L"No emoji data available after wait");
+            if (json) HeapFree(GetProcessHeap(), 0, json);
+        }
+    }
+    
+    CloseHandle(hDownloadMutex);
+    return 0;
+}
+
+// Convert a single Unicode codepoint (U+10000+) to surrogate pair length
+static int GetEmojiLength(const WCHAR* str) {
+    if (!str || !*str) return 0;
+    WCHAR c = *str;
+    
+    // Surrogate pair (emoji above U+FFFF)
+    if (c >= 0xD800 && c <= 0xDBFF && *(str+1) >= 0xDC00 && *(str+1) <= 0xDFFF) {
+        int len = 2;
+        // Skip variation selectors (U+FE00-U+FE0F)
+        while (str[len] >= 0xFE00 && str[len] <= 0xFE0F) len++;
+        // Skip ZWJ (U+200D) and following emoji
+        if (str[len] == 0x200D) {
+            int next = GetEmojiLength(str + len + 1);
+            if (next > 0) len += 1 + next;
+        }
+        return len;
+    }
+    
+    // Single-char emoji in BMP
+    if ((c >= 0x2600 && c <= 0x27BF) ||  // Misc symbols, dingbats
+        (c >= 0x2700 && c <= 0x27BF) ||
+        (c >= 0x2B00 && c <= 0x2BFF) ||
+        (c >= 0x2000 && c <= 0x206F) ||  // General punctuation
+        (c >= 0x2100 && c <= 0x21FF) ||  // Letterlike, arrows
+        (c >= 0x2300 && c <= 0x23FF) ||  // Misc technical
+        (c >= 0x25A0 && c <= 0x25FF) ||  // Geometric shapes
+        (c >= 0x2900 && c <= 0x297F) ||  // Supplemental arrows
+        (c == 0x200D) ||                  // ZWJ
+        (c == 0x20E3) ||                  // Combining enclosing keycap
+        (c >= 0xFE00 && c <= 0xFE0F) ||  // Variation selectors
+        (c == 0x00A9) || (c == 0x00AE))  // © ®
+    {
+        int len = 1;
+        while (str[len] >= 0xFE00 && str[len] <= 0xFE0F) len++;
+        if (str[len] == 0x200D) {
+            int next = GetEmojiLength(str + len + 1);
+            if (next > 0) len += 1 + next;
+        }
+        return len;
+    }
+    
+    return 0;
+}
+
+static const WCHAR* LookupEmoji(const WCHAR* str, int* matchLen) {
+    if (!str || !*str) return nullptr;
+    if (!InterlockedCompareExchange(&g_emojiTableReady, 1, 1)) return nullptr;
+    
+    LONG count = InterlockedCompareExchange(&g_emojiCount, 0, 0);
+    // Read actual count without modifying
+    count = g_emojiCount;
+    
+    for (LONG i = 0; i < count; i++) {
+        const WCHAR* sur = g_dynamicEmojiTable[i].surrogates;
+        int eLen = (int)wcslen(sur);
+        if (eLen > 0 && wcsncmp(str, sur, eLen) == 0) {
+            int totalLen = eLen;
+            while (str[totalLen] >= 0xFE00 && str[totalLen] <= 0xFE0F) totalLen++;
+            *matchLen = totalLen;
+            return g_dynamicEmojiTable[i].name;
+        }
+    }
+    
+    return nullptr;
+}
+
+static void ConvertEmojisToNames(WCHAR* str, int bufSize) {
+    if (!str || !str[0]) return;
+    
+    WCHAR temp[1024] = {};
+    int tempPos = 0;
+    int srcPos = 0;
+    int srcLen = (int)wcslen(str);
+    
+    while (srcPos < srcLen && tempPos < (int)ARRAYSIZE(temp) - 32) {
+        // Try to match a known emoji
+        int matchLen = 0;
+        const WCHAR* name = LookupEmoji(str + srcPos, &matchLen);
+        
+        if (name) {
+            int nameLen = (int)wcslen(name);
+            if (tempPos + nameLen < (int)ARRAYSIZE(temp) - 1) {
+                wcscpy(temp + tempPos, name);
+                tempPos += nameLen;
+                srcPos += matchLen;
+                continue;
+            }
+        }
+        
+        // Check if it's an unknown emoji (surrogate pair not in table)
+        int emojiLen = GetEmojiLength(str + srcPos);
+        if (emojiLen > 0) {
+            // Unknown emoji - skip it entirely (or you could keep it)
+            srcPos += emojiLen;
+            continue;
+        }
+        
+        // Regular character
+        temp[tempPos++] = str[srcPos++];
+    }
+    
+    temp[tempPos] = L'\0';
+    wcsncpy(str, temp, bufSize - 1);
+    str[bufSize - 1] = L'\0';
+}
+
+static void ConvertHeartNameToSymbol(WCHAR* str, int bufSize) {
+    if (!str || !str[0]) return;
+    
+    const WCHAR* search = L":heart:";
+    const WCHAR* replace = L"\u2764";
+    int searchLen = 7;  // length of ":heart:"
+    
+    WCHAR temp[1024] = {};
+    int tempPos = 0;
+    int srcPos = 0;
+    int srcLen = (int)wcslen(str);
+    
+    while (srcPos < srcLen && tempPos < (int)ARRAYSIZE(temp) - 2) {
+        // Check for :heart: match (case-sensitive)
+        if (srcPos + searchLen <= srcLen && 
+            wcsncmp(str + srcPos, search, searchLen) == 0) {
+            temp[tempPos++] = replace[0];
+            srcPos += searchLen;
+        } else {
+            temp[tempPos++] = str[srcPos++];
+        }
+    }
+    
+    temp[tempPos] = L'\0';
+    wcsncpy(str, temp, bufSize - 1);
+    str[bufSize - 1] = L'\0';
+}
+
 static void StripInvisibleChars(WCHAR* str) {
     if (!str) return;
 
@@ -512,27 +1284,19 @@ static void StripInvisibleChars(WCHAR* str) {
     while (*read) {
         WCHAR c = *read;
 
-        if (c >= 0xFE00 && c <= 0xFE0F) { read++; continue; }
-        if (c >= 0x200B && c <= 0x200F) { read++; continue; }
+        // Skip invisible formatting characters (but NOT emoji-related ones)
+        if (c >= 0x200B && c <= 0x200D) { read++; continue; }  // ZWJ kept by emoji converter
+        if (c >= 0x200E && c <= 0x200F) { read++; continue; }
         if (c >= 0x2028 && c <= 0x202F) { read++; continue; }
         if (c >= 0x2060 && c <= 0x2069) { read++; continue; }
         if (c == 0xFEFF) { read++; continue; }
         if (c == 0xFFFC || c == 0xFFFD) { read++; continue; }
 
-        if (c >= 0xD800 && c <= 0xDBFF) {
-            if (*(read + 1) >= 0xDC00 && *(read + 1) <= 0xDFFF) {
-                read += 2;
-            } else {
-                read++;
-            }
-            continue;
-        }
-        if (c >= 0xDC00 && c <= 0xDFFF) { read++; continue; }
-
         *write++ = *read++;
     }
     *write = L'\0';
 
+    // Trim leading spaces
     WCHAR* start = str;
     while (*start == L' ') start++;
     if (start != str) {
@@ -541,11 +1305,13 @@ static void StripInvisibleChars(WCHAR* str) {
         *dst = L'\0';
     }
 
+    // Trim trailing spaces
     int len = (int)wcslen(str);
     while (len > 0 && str[len - 1] == L' ') {
         str[--len] = L'\0';
     }
 
+    // Collapse multiple spaces
     read = str;
     write = str;
     bool lastWasSpace = false;
@@ -573,7 +1339,6 @@ static void ParseTextFromXmlString(const WCHAR* xml) {
     g_haveXmlText = false;
     if (!xml) return;
 
-    // Extract image src
     const WCHAR* imgTag = wcsstr(xml, L"<image");
     if (imgTag) {
         const WCHAR* srcAttr = wcsstr(imgTag, L"src='");
@@ -591,12 +1356,10 @@ static void ParseTextFromXmlString(const WCHAR* xml) {
                 for (WCHAR* p = g_lastImagePath; *p; p++) {
                     if (*p == L'/') *p = L'\\';
                 }
-                Wh_Log(L"Notification image: \"%s\"", g_lastImagePath);
             }
         }
     }
 
-    // Extract <text> elements
     int textIndex = 0;
     const WCHAR* pos = xml;
 
@@ -642,6 +1405,10 @@ static void ParseTextFromXmlString(const WCHAR* xml) {
 
     DecodeXmlEntities(g_lastXmlTitle);
     DecodeXmlEntities(g_lastXmlBody);
+    ConvertEmojisToNames(g_lastXmlTitle, ARRAYSIZE(g_lastXmlTitle));
+    ConvertEmojisToNames(g_lastXmlBody, ARRAYSIZE(g_lastXmlBody));
+    ConvertHeartNameToSymbol(g_lastXmlTitle, ARRAYSIZE(g_lastXmlTitle));
+    ConvertHeartNameToSymbol(g_lastXmlBody, ARRAYSIZE(g_lastXmlBody));
     StripInvisibleChars(g_lastXmlTitle);
     StripInvisibleChars(g_lastXmlBody);
 
@@ -685,16 +1452,6 @@ static HRESULT STDMETHODCALLTYPE LoadXml_Hook(void* pThis, HSTRING xml) {
     const WCHAR* xmlStr = WindowsGetStringRawBuffer(xml, &len);
 
     if (xmlStr && len > 0) {
-        Wh_Log(L"=== RAW XML (len=%u) ===", len);
-        const int CHUNK = 500;
-        for (UINT32 i = 0; i < len; i += CHUNK) {
-            WCHAR chunk[CHUNK + 1] = {};
-            int cl = MIN_VAL((int)(len - i), CHUNK);
-            wcsncpy(chunk, xmlStr + i, cl);
-            chunk[cl] = L'\0';
-            Wh_Log(L"%s", chunk);
-        }
-
         if (wcsstr(xmlStr, L"<toast")) {
             ParseTextFromXmlString(xmlStr);
         }
@@ -859,11 +1616,9 @@ HRESULT WINAPI RoActivateInstance_Hook(HSTRING classId, void** instance) {
 // Windhawk functions
 
 BOOL Wh_ModInit(void) {
-    Wh_Log(L"Discord Balloon Notifications mod started");
+    Wh_Log(L"Discord Balloon Notifications mod started (PID %lu)", GetCurrentProcessId());
 
     LoadSettings();
-    
-    g_currentPid = GetCurrentProcessId();
 
     WCHAR exePath[MAX_PATH];
     if (GetModuleFileNameW(nullptr, exePath, MAX_PATH)) {
@@ -873,10 +1628,17 @@ BOOL Wh_ModInit(void) {
 
     InitializeCriticalSection(&g_cs);
 
+        // Allocate emoji table
+    g_dynamicEmojiTable = (DynamicEmojiEntry*)HeapAlloc(GetProcessHeap(), 
+        HEAP_ZERO_MEMORY, sizeof(DynamicEmojiEntry) * MAX_EMOJI_ENTRIES);
+    
+    // Start emoji loading in background
+    HANDLE hEmojiThread = CreateThread(nullptr, 0, EmojiLoadThread, nullptr, 0, nullptr);
+    if (hEmojiThread) CloseHandle(hEmojiThread);
+
     g_hThread = CreateThread(nullptr, 0, BalloonThread, nullptr, 0, nullptr);
     Sleep(200);
     
-    // Start Discord process monitor thread
     g_stopMonitor = false;
     g_hMonitorThread = CreateThread(nullptr, 0, DiscordMonitorThread, nullptr, 0, nullptr);
 
@@ -891,7 +1653,6 @@ BOOL Wh_ModInit(void) {
         if (p2) Wh_SetFunctionHook(p2, (void*)RoActivateInstance_Hook, (void**)&RoActivateInstance_Orig);
     }
 
-    Wh_Log(L"Mod init complete");
     return TRUE;
 }
 
@@ -900,7 +1661,6 @@ void Wh_ModSettingsChanged(void) {
 }
 
 void Wh_ModUninit(void) {
-    // Stop monitor thread
     g_stopMonitor = true;
     if (g_hMonitorThread) {
         WaitForSingleObject(g_hMonitorThread, 3000);
@@ -926,6 +1686,20 @@ void Wh_ModUninit(void) {
     if (g_hAppIcon)
         DestroyIcon(g_hAppIcon);
 
+    if (g_hTrayMutex) {
+        if (g_ownsTray) {
+            ReleaseMutex(g_hTrayMutex);
+            g_ownsTray = false;
+        }
+        CloseHandle(g_hTrayMutex);
+        g_hTrayMutex = nullptr;
+    }
+
+    if (g_dynamicEmojiTable) {
+        HeapFree(GetProcessHeap(), 0, g_dynamicEmojiTable);
+        g_dynamicEmojiTable = nullptr;
+    }
+    
     DeleteCriticalSection(&g_cs);
     UnregisterClassW(L"WindhawkDiscordBalloonClass", GetModuleHandleW(nullptr));
 }
