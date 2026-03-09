@@ -6,6 +6,7 @@
 // @author          repensky
 // @github          https://github.com/repensky
 // @include         Discord.exe
+// @include         vesktop.exe
 // @compilerOptions -lole32 -loleaut32 -lruntimeobject -lshlwapi -lshell32 -lwininet
 
 // ==/WindhawkMod==
