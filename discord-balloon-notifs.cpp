@@ -20,8 +20,6 @@ Converts Discord's modern Windows toast notifications into balloon tips that app
 # WARNING!
 The use of third party Discord clients with this mod is **NOT** supported! This mod is designed for the official Discord app. It may or may not function properly with unofficial Discord clients. Try on your own risk.
 
-This mod downloads Discord emoji database on first run for displaying emoji shortcode purposes as it does not support displaying all emojis.
-
 Enable this mod before starting Discord. If Discord is already running when you enable the mod, restart Discord manually. Otherwise, Discord may **crash** if not restarted on next notification.
 
 ## Requirement:
@@ -41,6 +39,9 @@ This is tested on **Windows 10 21H2 IoT Enterprise LTSC**. It may or may not fun
 **Windows 11** versions may need to use **ExplorerPatcher** for notifications to be shown in a balloon format.
 
 ## Note 2:
+This mod **downloads** Discord emoji database only on first run for displaying emoji shortcode purposes as it does not support displaying all emojis.
+
+## Note 3:
 Balloon display duration is controlled by Windows.
 To change, navigate to **Control Panel > Ease of Access Center > Use the computer without a display > How long should Windows notification dialog boxes stay open**
 
